@@ -1,31 +1,23 @@
 """
-Live Mask Detection  —  v4 (Smart Per-Person Tracking)
-=======================================================
-Logic:
-  - Each detected face gets a persistent ID based on position
-  - A face is only logged ONCE per unique status (With Mask / No Mask)
-  - If the SAME person changes status (puts on / removes mask), log again
-  - If face disappears then reappears, treated as same person if in same region
+Mask Detection Web App — Streamlit Cloud Ready
+===============================================
+No Tk, NO desktop dependencies.
+Works fully in browser via Streamlit.
 
-Requirements:
-    pip install ultralytics opencv-python openpyxl pillow requests numpy scipy
+Upload to GitHub → deploy on share.streamlit.io
 """
 
-import os, time, threading, shutil, tempfile, numpy as np
-import tkinter as tk
-from tkinter import ttk, messagebox
-from datetime import datetime
+# ── No Tk imports anywhere ───────────────────────────────────
+import streamlit as st
 import cv2
-from PIL import Image, ImageTk
+import numpy as np
+import pandas as pd
+import io, time, os
+from datetime import datetime
+from PIL import Image
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment
 from openpyxl.utils import get_column_letter
-
-try:
-    import requests
-    REQUESTS_OK = True
-except ImportError:
-    REQUESTS_OK = False
 
 try:
     from ultralytics import YOLO
@@ -33,636 +25,554 @@ try:
 except ImportError:
     YOLO_AVAILABLE = False
 
-EXCEL_FILE = "mask_detection_log.xlsx"
+# ── Page config ───────────────────────────────────────────────────
+st.set_page_config(
+    page_title="Mask Detection System",
+    page_icon="🎭",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
 
-STATUS_COLOR = {
-    "With Mask":     ("#27ae60", (0, 210, 0),   "🟢"),
-    "No Mask":       ("#e74c3c", (0, 0, 220),   "🔴"),
-    "Improper Mask": ("#f39c12", (0, 165, 255), "🟡"),
+# ── CSS ───────────────────────────────────────────────────────────
+st.markdown("""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=Space+Mono:wght@400;700&display=swap');
+
+html, body, [class*="css"] { font-family: 'Syne', sans-serif; }
+
+.stApp { background: #0a0e1a; color: #e8eaf0; }
+
+[data-testid="stSidebar"] {
+    background: #10152a !important;
+    border-right: 1px solid #1f2744;
 }
 
+.hero-title {
+    font-size: 2.4rem; font-weight: 800;
+    background: linear-gradient(135deg, #e94560 0%, #f5a623 100%);
+    -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+    background-clip: text; line-height: 1.1;
+}
+.hero-sub {
+    font-family: 'Space Mono', monospace; font-size: 0.72rem;
+    color: #555e80; letter-spacing: 0.12em; text-transform: uppercase; margin-top:4px;
+}
+
+.status-big {
+    font-size: 1.35rem; font-weight: 700; padding: 14px 24px;
+    border-radius: 12px; text-align: center; margin: 8px 0;
+    font-family: 'Space Mono', monospace;
+}
+.status-mask     { background:#0d3320; color:#27ae60; border:1px solid #27ae60; }
+.status-nomask   { background:#330d0d; color:#e74c3c; border:1px solid #e74c3c; }
+.status-improper { background:#332a00; color:#f39c12; border:1px solid #f39c12; }
+.status-idle     { background:#13192e; color:#555e80; border:1px solid #1f2744; }
+
+.log-row {
+    font-family: 'Space Mono', monospace; font-size: 0.75rem;
+    padding: 7px 12px; border-radius: 7px; margin-bottom: 4px;
+    display: flex; justify-content: space-between; align-items: center;
+}
+.log-mask     { background:#0d3320; color:#27ae60; }
+.log-nomask   { background:#330d0d; color:#e74c3c; }
+.log-improper { background:#332a00; color:#f39c12; }
+
+.live-dot {
+    display:inline-block; width:10px; height:10px; border-radius:50%;
+    background:#e74c3c; animation: blink 1.2s infinite; margin-right:6px;
+}
+@keyframes blink { 0%,100%{opacity:1} 50%{opacity:0.2} }
+
+.idle-box {
+    background:#10152a; border:2px dashed #1f2744; border-radius:14px;
+    height:360px; display:flex; align-items:center; justify-content:center;
+    flex-direction:column; gap:14px;
+}
+.idle-icon { font-size:3rem; }
+.idle-text {
+    font-family:'Space Mono',monospace; color:#555e80;
+    font-size:0.82rem; letter-spacing:0.08em;
+}
+
+.stButton > button {
+    background: #e94560 !important; color: white !important;
+    border: none !important; border-radius: 8px !important;
+    font-family: 'Syne', sans-serif !important; font-weight: 700 !important;
+    width: 100%;
+}
+.stButton > button:hover { background: #c73650 !important; }
+
+hr { border-color: #1f2744 !important; }
+
+[data-testid="stMetricValue"] {
+    font-family: 'Space Mono', monospace !important;
+    font-size: 1.8rem !important; color: #e8eaf0 !important;
+}
+</style>
+""", unsafe_allow_html=True)
+
+
 # ═══════════════════════════════════════════════════════════════════
-# FACE TRACKER  — assigns stable IDs to faces across frames
+# FACE TRACKER
 # ═══════════════════════════════════════════════════════════════════
 
 class FaceTracker:
-    """
-    Lightweight centroid tracker.
-    - Matches detections to existing tracks by distance.
-    - Each track remembers its last logged status.
-    - Only triggers a log when status CHANGES for that track.
-    """
-
-    MAX_DISAPPEARED = 40    # frames before a track is removed
-    MAX_DISTANCE    = 120   # pixels — max centroid shift to match same face
+    MAX_DISAPPEARED = 30
+    MAX_DISTANCE    = 120
 
     def __init__(self):
-        self.next_id    = 0
-        self.tracks     = {}   # id → {centroid, status, disappeared, bbox}
-        self._lock      = threading.Lock()
+        self.next_id = 0
+        self.tracks  = {}
 
-    def _centroid(self, x1, y1, x2, y2):
+    def _cen(self, x1, y1, x2, y2):
         return np.array([(x1+x2)//2, (y1+y2)//2], dtype=float)
 
     def update(self, detections):
-        """
-        detections: list of (x1,y1,x2,y2,status,conf)
-        Returns:    list of (x1,y1,x2,y2,status,conf,face_id,is_new_status)
-        """
-        with self._lock:
-            # ── mark all tracks as disappeared this frame ──────────
-            for tid in list(self.tracks):
-                self.tracks[tid]["disappeared"] += 1
+        for tid in self.tracks:
+            self.tracks[tid]["gone"] += 1
 
-            if not detections:
-                # purge stale
-                for tid in [t for t,v in self.tracks.items()
-                            if v["disappeared"] > self.MAX_DISAPPEARED]:
-                    del self.tracks[tid]
-                return []
+        stale = [t for t,v in self.tracks.items()
+                 if v["gone"] > self.MAX_DISAPPEARED]
+        for t in stale:
+            del self.tracks[t]
 
-            centroids = [self._centroid(*d[:4]) for d in detections]
-            output    = []
+        if not detections:
+            return []
 
-            if not self.tracks:
-                # Register all as new
-                for i, det in enumerate(detections):
-                    tid = self._register(centroids[i], det)
-                    x1,y1,x2,y2,status,conf = det
-                    output.append((x1,y1,x2,y2,status,conf,tid, True))
-                return output
+        cents  = [self._cen(*d[:4]) for d in detections]
+        output = []
 
-            # Match detections → existing tracks by nearest centroid
-            track_ids   = list(self.tracks.keys())
-            track_cents = np.array([self.tracks[t]["centroid"]
-                                    for t in track_ids])
-
-            used_tracks = set()
-            used_dets   = set()
-
-            # distance matrix
-            diffs = (track_cents[:, None, :] -
-                     np.array(centroids)[None, :, :])
-            dists = np.linalg.norm(diffs, axis=2)   # shape (T, D)
-
-            # greedy nearest-neighbour match
-            for _ in range(min(len(track_ids), len(detections))):
-                if dists.size == 0:
-                    break
-                t_idx, d_idx = np.unravel_index(dists.argmin(), dists.shape)
-                if dists[t_idx, d_idx] > self.MAX_DISTANCE:
-                    break
-                tid = track_ids[t_idx]
-                used_tracks.add(t_idx)
-                used_dets.add(d_idx)
-                det    = detections[d_idx]
-                status = det[4]
-                # Update track
-                self.tracks[tid]["centroid"]    = centroids[d_idx]
-                self.tracks[tid]["bbox"]        = det[:4]
-                self.tracks[tid]["disappeared"] = 0
-                # Determine if status changed
-                prev   = self.tracks[tid]["last_logged_status"]
-                is_new = (prev != status)
-                if is_new:
-                    self.tracks[tid]["last_logged_status"] = status
-                output.append((*det, tid, is_new))
-                # blank out row/col so it can't be reused
-                dists[t_idx, :] = 1e9
-                dists[:, d_idx] = 1e9
-
-            # Unmatched detections → new tracks
-            for d_idx, det in enumerate(detections):
-                if d_idx not in used_dets:
-                    tid = self._register(centroids[d_idx], det)
-                    output.append((*det, tid, True))
-
-            # Purge stale tracks
-            for tid in [t for t,v in self.tracks.items()
-                        if v["disappeared"] > self.MAX_DISAPPEARED]:
-                del self.tracks[tid]
-
+        if not self.tracks:
+            for i, det in enumerate(detections):
+                tid = self._reg(cents[i], det)
+                output.append((*det, tid, True))
             return output
 
-    def _register(self, centroid, det):
-        tid = self.next_id
-        self.next_id += 1
-        self.tracks[tid] = {
-            "centroid":            centroid,
-            "bbox":                det[:4],
-            "disappeared":         0,
-            "last_logged_status":  det[4],   # log immediately on first sight
-        }
+        tids   = list(self.tracks.keys())
+        tcents = np.array([self.tracks[t]["cen"] for t in tids])
+        diffs  = tcents[:,None,:] - np.array(cents)[None,:,:]
+        dists  = np.linalg.norm(diffs, axis=2)
+
+        used_t, used_d = set(), set()
+        for _ in range(min(len(tids), len(detections))):
+            if dists.size == 0: break
+            ti, di = np.unravel_index(dists.argmin(), dists.shape)
+            if dists[ti, di] > self.MAX_DISTANCE: break
+            tid = tids[ti]; used_t.add(ti); used_d.add(di)
+            det = detections[di]
+            self.tracks[tid].update({"cen": cents[di],
+                                     "bbox": det[:4], "gone": 0})
+            prev   = self.tracks[tid]["last"]
+            is_new = prev != det[4]
+            if is_new:
+                self.tracks[tid]["last"] = det[4]
+            output.append((*det, tid, is_new))
+            dists[ti, :] = 1e9
+            dists[:, di] = 1e9
+
+        for di, det in enumerate(detections):
+            if di not in used_d:
+                tid = self._reg(cents[di], det)
+                output.append((*det, tid, True))
+
+        return output
+
+    def _reg(self, cen, det):
+        tid = self.next_id; self.next_id += 1
+        self.tracks[tid] = {"cen": cen, "bbox": det[:4],
+                            "gone": 0, "last": det[4]}
         return tid
-
-
-# ═══════════════════════════════════════════════════════════════════
-# EXCEL
-# ═══════════════════════════════════════════════════════════════════
-
-def _excel_init(path):
-    if os.path.exists(path):
-        try:
-            return openpyxl.load_workbook(path)
-        except Exception:
-            pass
-    wb = openpyxl.Workbook()
-    ws = wb.active
-    ws.title = "Detection Log"
-    headers = ["#", "Timestamp", "Date", "Time",
-               "Face ID", "Status", "Confidence (%)", "Notes"]
-    hfill = PatternFill("solid", fgColor="1F4E79")
-    hfont = Font(bold=True, color="FFFFFF", name="Arial", size=11)
-    for c, h in enumerate(headers, 1):
-        cell = ws.cell(row=1, column=c, value=h)
-        cell.fill, cell.font = hfill, hfont
-        cell.alignment = Alignment(horizontal="center", vertical="center")
-    ws.row_dimensions[1].height = 25
-    for i, w in enumerate([5, 22, 12, 10, 8, 18, 16, 24], 1):
-        ws.column_dimensions[get_column_letter(i)].width = w
-    return wb
-
-
-def excel_log(face_id: int, status: str, conf: float, notes: str = ""):
-    wb  = _excel_init(EXCEL_FILE)
-    ws  = wb.active
-    row = ws.max_row + 1
-    now = datetime.now()
-
-    fills = {"With Mask":     ("C6EFCE", "276221"),
-             "No Mask":       ("FFC7CE", "9C0006"),
-             "Improper Mask": ("FFEB9C", "9C5700")}
-    bg, fg = fills.get(status, ("FFFFFF", "000000"))
-    fill   = PatternFill("solid", fgColor=bg)
-    font   = Font(color=fg, name="Arial")
-
-    vals = [row-1,
-            now.strftime("%Y-%m-%d %H:%M:%S"),
-            now.strftime("%Y-%m-%d"),
-            now.strftime("%H:%M:%S"),
-            f"Face-{face_id}",
-            status,
-            round(conf*100, 1),
-            notes]
-    for c, v in enumerate(vals, 1):
-        cell = ws.cell(row=row, column=c, value=v)
-        cell.fill, cell.font = fill, font
-        cell.alignment = Alignment(horizontal="center")
-
-    # Safe save via temp file
-    tmp_fd, tmp_path = tempfile.mkstemp(
-        suffix=".xlsx",
-        dir=os.path.dirname(os.path.abspath(EXCEL_FILE)) or ".")
-    os.close(tmp_fd)
-    try:
-        wb.save(tmp_path)
-        if os.path.exists(EXCEL_FILE):
-            os.remove(EXCEL_FILE)
-        shutil.move(tmp_path, EXCEL_FILE)
-    except PermissionError:
-        try: os.remove(tmp_path)
-        except: pass
-        raise
 
 
 # ═══════════════════════════════════════════════════════════════════
 # SKIN HEURISTIC
 # ═══════════════════════════════════════════════════════════════════
 
-_SKIN_LO = np.array([0,  20,  70], np.uint8)
-_SKIN_HI = np.array([20, 255, 255], np.uint8)
+_LO = np.array([0,  20,  70], np.uint8)
+_HI = np.array([20, 255, 255], np.uint8)
 
-def _skin_ratio(roi):
-    if roi is None or roi.size == 0:
-        return 0.0
-    hsv  = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
-    mask = cv2.inRange(hsv, _SKIN_LO, _SKIN_HI)
-    return cv2.countNonZero(mask) / max(1, roi.shape[0]*roi.shape[1])
+def _skin(roi):
+    if roi is None or roi.size == 0: return 0.0
+    m = cv2.inRange(cv2.cvtColor(roi, cv2.COLOR_BGR2HSV), _LO, _HI)
+    return cv2.countNonZero(m) / max(1, roi.shape[0]*roi.shape[1])
 
-def classify_face(frame, x1, y1, x2, y2):
-    fh    = y2-y1
-    y_mid = y1+fh//2
-    if _skin_ratio(frame[y_mid:y2, x1:x2]) > 0.55:
+def classify(frame, x1, y1, x2, y2):
+    fh = y2-y1; ym = y1+fh//2
+    if _skin(frame[ym:y2, x1:x2]) > 0.55:
         return "No Mask", 0.82
-    y_nose = y1+int(fh*0.45)
-    y_lip  = y1+int(fh*0.65)
-    if _skin_ratio(frame[y_nose:y_lip, x1:x2]) > 0.40:
+    if _skin(frame[y1+int(fh*.45):y1+int(fh*.65), x1:x2]) > 0.40:
         return "Improper Mask", 0.74
     return "With Mask", 0.86
 
 
 # ═══════════════════════════════════════════════════════════════════
-# DETECTION BACKENDS
+# DETECTOR  (cached so model loads only once)
 # ═══════════════════════════════════════════════════════════════════
 
-class HaarDetector:
-    def __init__(self):
-        self.cc = cv2.CascadeClassifier(
-            cv2.data.haarcascades+"haarcascade_frontalface_default.xml")
-    def detect(self, frame):
-        gray  = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        faces = self.cc.detectMultiScale(
-                    gray, 1.1, 5, minSize=(60,60))
-        return [(fx,fy,fx+fw,fy+fh)+classify_face(frame,fx,fy,fx+fw,fy+fh)
-                for (fx,fy,fw,fh) in faces]
+@st.cache_resource(show_spinner="Loading detection model…")
+def load_detector():
+    # Try custom mask model first
+    if YOLO_AVAILABLE and os.path.exists("mask_yolov8.pt"):
+        try:
+            return ("yolo_mask", YOLO("mask_yolov8.pt"))
+        except Exception:
+            pass
+    # Try face model
+    if YOLO_AVAILABLE and os.path.exists("yolov8n-face.pt"):
+        try:
+            return ("yolo_face", YOLO("yolov8n-face.pt"))
+        except Exception:
+            pass
+    # Haar fallback — always works, zero download
+    cc = cv2.CascadeClassifier(
+        cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+    return ("haar", cc)
 
-FACE_MODEL_URL  = ("https://github.com/ultralytics/assets/releases/"
-                   "download/v0.0.0/yolov8n-face.pt")
-FACE_MODEL_PATH = "yolov8n-face.pt"
-
-class YOLOFaceDetector:
-    def __init__(self, model_path, conf=0.45):
-        self.model = YOLO(model_path)
-        self.conf  = conf
-    def detect(self, frame):
-        out = []
-        for r in self.model(frame, verbose=False, conf=self.conf):
-            for box in r.boxes:
-                x1,y1,x2,y2 = map(int, box.xyxy[0])
-                out.append((x1,y1,x2,y2)+classify_face(frame,x1,y1,x2,y2))
-        return out
-
-_LABEL_MAP = {
-    "with_mask":"With Mask","mask_weared_correct":"With Mask",
-    "mask":"With Mask","wearing_mask":"With Mask",
-    "without_mask":"No Mask","no_mask":"No Mask",
+_LMAP = {
+    "with_mask":"With Mask", "mask_weared_correct":"With Mask",
+    "mask":"With Mask", "wearing_mask":"With Mask",
+    "without_mask":"No Mask", "no_mask":"No Mask",
     "mask_weared_incorrect":"Improper Mask",
-    "improper_mask":"Improper Mask","incorrect_mask":"Improper Mask",
+    "improper_mask":"Improper Mask", "incorrect_mask":"Improper Mask",
 }
 
-class YOLOMaskDetector:
-    def __init__(self, model_path, conf=0.45):
-        self.model = YOLO(model_path)
-        self.conf  = conf
-    def detect(self, frame):
+def detect(frame, info, conf=0.45):
+    kind, model = info
+    if kind == "yolo_mask":
         out = []
-        for r in self.model(frame, verbose=False, conf=self.conf):
-            for box in r.boxes:
-                x1,y1,x2,y2 = map(int, box.xyxy[0])
-                conf   = float(box.conf[0])
-                label  = self.model.names.get(
-                    int(box.cls[0]),"").lower().replace(" ","_")
-                out.append((x1,y1,x2,y2,
-                            _LABEL_MAP.get(label,f"Class:{label}"),conf))
+        for r in model(frame, verbose=False, conf=conf):
+            for b in r.boxes:
+                x1,y1,x2,y2 = map(int, b.xyxy[0])
+                c  = float(b.conf[0])
+                lbl= model.names.get(int(b.cls[0]),"").lower().replace(" ","_")
+                out.append((x1,y1,x2,y2, _LMAP.get(lbl,lbl), c))
         return out
+    elif kind == "yolo_face":
+        out = []
+        for r in model(frame, verbose=False, conf=conf):
+            for b in r.boxes:
+                x1,y1,x2,y2 = map(int, b.xyxy[0])
+                out.append((x1,y1,x2,y2)+classify(frame,x1,y1,x2,y2))
+        return out
+    else:  # haar
+        gray  = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        faces = model.detectMultiScale(gray, 1.1, 5, minSize=(60,60))
+        return [(fx,fy,fx+fw,fy+fh)+classify(frame,fx,fy,fx+fw,fy+fh)
+                for (fx,fy,fw,fh) in faces]
 
 
 # ═══════════════════════════════════════════════════════════════════
-# APPLICATION
+# DRAWING
 # ═══════════════════════════════════════════════════════════════════
 
-class App:
-    def __init__(self, root):
-        self.root        = root
-        self.root.title("🎭 Live Mask Detection")
-        self.root.configure(bg="#1a1a2e")
-        self.root.resizable(True, True)
-        self.cap         = None
-        self.detector    = None
-        self.tracker     = FaceTracker()
-        self.running     = False
-        self.log_int     = 3
-        self.stats       = {"With Mask":0,"No Mask":0,
-                            "Improper Mask":0,"total":0}
-        self._imgtk      = None
-        self._excel_warn = False
-        self._build_ui()
-        threading.Thread(target=self._init_detector, daemon=True).start()
+BGRS  = {"With Mask":(0,210,0),"No Mask":(0,0,220),"Improper Mask":(0,165,255)}
+EMOJI = {"With Mask":"✅","No Mask":"❌","Improper Mask":"⚠️"}
 
-    # ── UI ──────────────────────────────────────────────────────────
+def draw(frame, tracked):
+    for (x1,y1,x2,y2,status,conf,fid,is_new) in tracked:
+        bgr = BGRS.get(status,(150,150,150))
+        cv2.rectangle(frame,(x1,y1),(x2,y2),bgr,3)
+        lbl = f" Face-{fid} | {status}  {conf:.0%}"
+        (tw,th),_ = cv2.getTextSize(lbl,cv2.FONT_HERSHEY_SIMPLEX,0.65,2)
+        cv2.rectangle(frame,(x1,y1-th-16),(x1+tw+4,y1),bgr,-1)
+        cv2.putText(frame,lbl,(x1+2,y1-6),
+                    cv2.FONT_HERSHEY_SIMPLEX,0.65,(255,255,255),2,cv2.LINE_AA)
+        if is_new:
+            cv2.putText(frame,"● LOGGED",(x1,y2+22),
+                        cv2.FONT_HERSHEY_SIMPLEX,0.55,bgr,2,cv2.LINE_AA)
+    return frame
 
-    def _build_ui(self):
-        hdr = tk.Frame(self.root, bg="#16213e", pady=8)
-        hdr.pack(fill="x")
-        tk.Label(hdr, text="🎭  Live Mask Detection System",
-                 font=("Arial",18,"bold"), fg="#e94560", bg="#16213e").pack()
-        tk.Label(hdr,
-                 text="Each person logged ONCE per status change · Excel auto-save",
-                 font=("Arial",9), fg="#aaaaaa", bg="#16213e").pack()
 
-        body = tk.Frame(self.root, bg="#1a1a2e")
-        body.pack(fill="both", expand=True, padx=8, pady=8)
+# ═══════════════════════════════════════════════════════════════════
+# EXCEL EXPORT
+# ═══════════════════════════════════════════════════════════════════
 
-        # LEFT
-        lf = tk.Frame(body, bg="#1a1a2e")
-        lf.pack(side="left", fill="both", expand=True)
-        self.canvas = tk.Canvas(lf, bg="#0d1b2a",
-                                highlightthickness=2,
-                                highlightbackground="#2c3e50")
-        self.canvas.pack(fill="both", expand=True, padx=4, pady=4)
-        self.badge_var = tk.StringVar(value="⬤  Idle")
-        self.badge_lbl = tk.Label(lf, textvariable=self.badge_var,
-                                  font=("Arial",16,"bold"),
-                                  fg="#aaaaaa", bg="#1a1a2e")
-        self.badge_lbl.pack(pady=6)
+def build_excel(log):
+    wb = openpyxl.Workbook()
+    ws = wb.active; ws.title = "Detection Log"
+    headers = ["#","Timestamp","Date","Time",
+               "Face ID","Status","Confidence (%)","Notes"]
+    hfill = PatternFill("solid",fgColor="1F4E79")
+    hfont = Font(bold=True,color="FFFFFF",name="Arial",size=11)
+    for c,h in enumerate(headers,1):
+        cell=ws.cell(row=1,column=c,value=h)
+        cell.fill,cell.font=hfill,hfont
+        cell.alignment=Alignment(horizontal="center",vertical="center")
+    ws.row_dimensions[1].height=25
+    for i,w in enumerate([5,22,12,10,9,18,16,22],1):
+        ws.column_dimensions[get_column_letter(i)].width=w
 
-        # RIGHT
-        rp = tk.Frame(body, bg="#16213e", width=280, padx=14, pady=14)
-        rp.pack(side="right", fill="y", padx=(6,0))
-        rp.pack_propagate(False)
+    fills={"With Mask":("C6EFCE","276221"),
+           "No Mask":("FFC7CE","9C0006"),
+           "Improper Mask":("FFEB9C","9C5700")}
+    for idx,e in enumerate(log,1):
+        bg,fg=fills.get(e["status"],("FFFFFF","000000"))
+        fill=PatternFill("solid",fgColor=bg)
+        font=Font(color=fg,name="Arial")
+        vals=[idx, e["ts"], e["ts"][:10], e["ts"][11:19],
+              f"Face-{e['fid']}", e["status"],
+              round(e["conf"]*100,1), e.get("notes","")]
+        for c,v in enumerate(vals,1):
+            cell=ws.cell(row=idx+1,column=c,value=v)
+            cell.fill,cell.font=fill,font
+            cell.alignment=Alignment(horizontal="center")
+    buf=io.BytesIO(); wb.save(buf); buf.seek(0)
+    return buf.read()
 
-        def sep(lbl):
-            tk.Label(rp, text=lbl, font=("Arial",11,"bold"),
-                     fg="#e94560", bg="#16213e").pack(anchor="w", pady=(10,0))
-            ttk.Separator(rp, orient="horizontal").pack(fill="x", pady=3)
 
-        def kv(lbl, wfn):
-            f = tk.Frame(rp, bg="#16213e"); f.pack(fill="x", pady=2)
-            tk.Label(f, text=lbl, fg="white", bg="#16213e",
-                     font=("Arial",9), width=19, anchor="w").pack(side="left")
-            wfn(f)
+# ═══════════════════════════════════════════════════════════════════
+# SESSION STATE
+# ═══════════════════════════════════════════════════════════════════
 
-        sep("⚙  Controls")
-        self.cam_var  = tk.IntVar(value=0)
-        self.lint_var = tk.IntVar(value=3)
-        self.conf_var = tk.DoubleVar(value=0.45)
+def _init():
+    for k,v in [("log",[]),
+                ("tracker",FaceTracker()),
+                ("running",False),
+                ("stats",{"With Mask":0,"No Mask":0,"Improper Mask":0}),
+                ("uploaded_frame",None)]:
+        if k not in st.session_state:
+            st.session_state[k] = v
+_init()
 
-        kv("Camera index:", lambda f: tk.Spinbox(
-            f, from_=0, to=5, textvariable=self.cam_var,
-            width=5, font=("Arial",9)).pack(side="right"))
-        kv("Log interval (s):", lambda f: tk.Spinbox(
-            f, from_=1, to=60, textvariable=self.lint_var,
-            width=5, font=("Arial",9)).pack(side="right"))
-        kv("Confidence:", lambda f: tk.Scale(
-            f, variable=self.conf_var, from_=0.1, to=0.95,
-            resolution=0.05, orient="horizontal", bg="#16213e",
-            fg="white", length=100,
-            highlightthickness=0).pack(side="right"))
 
-        bs = dict(font=("Arial",10,"bold"), width=22,
-                  relief="flat", cursor="hand2", pady=7)
-        self.btn_start = tk.Button(rp, text="▶  Start Detection",
-                                   bg="#27ae60", fg="white",
-                                   command=self.start, **bs)
-        self.btn_start.pack(pady=(12,3))
-        self.btn_stop = tk.Button(rp, text="⏹  Stop",
-                                  bg="#e74c3c", fg="white",
-                                  command=self.stop,
-                                  state="disabled", **bs)
-        self.btn_stop.pack(pady=3)
-        tk.Button(rp, text="📊  Open Excel Log",
-                  bg="#2980b9", fg="white",
-                  command=self.open_excel, **bs).pack(pady=3)
-        tk.Button(rp, text="🔄  Reset Tracker",
-                  bg="#7f8c8d", fg="white",
-                  command=self.reset_tracker, **bs).pack(pady=3)
+# ═══════════════════════════════════════════════════════════════════
+# HEADER
+# ═══════════════════════════════════════════════════════════════════
 
-        self.excel_sv = tk.StringVar(value="📁 Excel: Ready")
-        tk.Label(rp, textvariable=self.excel_sv, fg="#2ecc71",
-                 bg="#16213e", font=("Arial",8)).pack(anchor="w", pady=(2,0))
+st.markdown("""
+<div style='padding:1.2rem 0 0.8rem 0'>
+  <div class='hero-title'>🎭 Mask Detection System</div>
+  <div class='hero-sub'>Real-time · Per-person tracking · Excel export</div>
+</div><hr>
+""", unsafe_allow_html=True)
 
-        sep("📈  Session Stats")
-        self._svars = {}
-        for k, (_,_,emoji) in STATUS_COLOR.items():
-            sv = tk.StringVar(value=f"{emoji}  {k}: 0")
-            self._svars[k] = sv
-            tk.Label(rp, textvariable=sv, fg="white",
-                     bg="#16213e", font=("Arial",10)).pack(anchor="w", pady=1)
-        self._total_sv = tk.StringVar(value="📋  Total logged: 0")
-        tk.Label(rp, textvariable=self._total_sv, fg="white",
-                 bg="#16213e", font=("Arial",10)).pack(anchor="w", pady=1)
 
-        # Active face count
-        self._faces_sv = tk.StringVar(value="👤  Active faces: 0")
-        tk.Label(rp, textvariable=self._faces_sv, fg="#3498db",
-                 bg="#16213e", font=("Arial",10,"bold")).pack(anchor="w",
-                                                               pady=1)
+# ═══════════════════════════════════════════════════════════════════
+# SIDEBAR
+# ═══════════════════════════════════════════════════════════════════
 
-        sep("🤖  Model Status")
-        self.model_sv = tk.StringVar(value="⏳ Initialising…")
-        tk.Label(rp, textvariable=self.model_sv, fg="#f39c12",
-                 bg="#16213e", font=("Arial",9),
-                 wraplength=235, justify="left").pack(anchor="w")
+with st.sidebar:
+    st.markdown("### ⚙️ Settings")
+    conf_val = st.slider("Confidence threshold", 0.10, 0.95, 0.45, 0.05)
+    mode     = st.radio("Detection mode",
+                        ["📷 Live Webcam", "🖼️ Upload Image"],
+                        index=0)
+    st.markdown("---")
 
-        sep("📋  Recent Logs")
-        self.log_box = tk.Text(rp, height=7, bg="#0d1b2a", fg="white",
-                               font=("Courier",8), state="disabled",
-                               relief="flat", wrap="none")
-        self.log_box.pack(fill="x")
+    st.markdown("### 📊 Session Stats")
+    c1,c2,c3 = st.columns(3)
+    c1.metric("✅ Mask",     st.session_state.stats["With Mask"])
+    c2.metric("❌ No Mask",  st.session_state.stats["No Mask"])
+    c3.metric("⚠️ Improper", st.session_state.stats["Improper Mask"])
+    st.markdown("---")
 
-    # ── Detector init ───────────────────────────────────────────────
+    st.markdown("### ℹ️ How it works")
+    st.info(
+        "**Smart per-person tracking:**\n\n"
+        "- Each face gets a unique **Face ID**\n"
+        "- Logged **once** on first detection\n"
+        "- Logged again **only if** status changes\n"
+        "  *(e.g. removes or puts on mask)*\n\n"
+        "Click **Reset Tracker** to start fresh."
+    )
+    st.markdown("---")
 
-    def _init_detector(self):
-        if YOLO_AVAILABLE and os.path.exists("mask_yolov8.pt"):
-            try:
-                self.detector = YOLOMaskDetector("mask_yolov8.pt",
-                                                  self.conf_var.get())
-                self.model_sv.set("✅ Custom mask_yolov8.pt")
-                return
-            except Exception:
-                pass
+    if st.button("🔄 Reset Tracker"):
+        st.session_state.tracker = FaceTracker()
+        st.success("Tracker reset!")
 
-        if YOLO_AVAILABLE and REQUESTS_OK:
-            try:
-                if not os.path.exists(FACE_MODEL_PATH):
-                    self.model_sv.set("⬇ Downloading YOLOv8-face (~6 MB)…")
-                    r = requests.get(FACE_MODEL_URL, timeout=40, stream=True)
-                    if r.status_code == 200:
-                        with open(FACE_MODEL_PATH,"wb") as f:
-                            for chunk in r.iter_content(65536):
-                                f.write(chunk)
-                self.detector = YOLOFaceDetector(FACE_MODEL_PATH,
-                                                   self.conf_var.get())
-                self.model_sv.set(
-                    "✅ YOLOv8-face + heuristic\n"
-                    "Place mask_yolov8.pt here for best accuracy")
-                return
-            except Exception:
-                pass
+    st.markdown("---")
+    if st.session_state.log:
+        st.download_button(
+            "📥 Download Excel Log",
+            data=build_excel(st.session_state.log),
+            file_name=f"mask_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+        )
+    else:
+        st.caption("📥 Excel download appears after first detection.")
 
-        self.detector = HaarDetector()
-        self.model_sv.set(
-            "✅ OpenCV Haar + mask heuristic\n"
-            "Place mask_yolov8.pt here for best accuracy")
 
-    # ── Camera ──────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════
+# MAIN AREA
+# ═══════════════════════════════════════════════════════════════════
 
-    def start(self):
-        cam = self.cam_var.get()
-        cap = (cv2.VideoCapture(cam, cv2.CAP_DSHOW)
-               if os.name == "nt" else cv2.VideoCapture(cam))
-        if not cap.isOpened():
-            cap = cv2.VideoCapture(cam)
-        if not cap.isOpened():
-            messagebox.showerror("Camera Error",
-                                 f"Cannot open camera {cam}.")
+left, right = st.columns([3,2], gap="large")
+
+with right:
+    st.markdown("### 📋 Detection Log")
+    log_ph = st.empty()
+
+    st.markdown("### 👤 Active Faces")
+    face_ph = st.empty()
+
+    def render_log():
+        if not st.session_state.log:
+            log_ph.info("No detections yet.")
             return
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH,  1280)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-        cap.set(cv2.CAP_PROP_FPS, 30)
-        self.cap          = cap
-        self.running      = True
-        self.log_int      = self.lint_var.get()
-        self._excel_warn  = False
-        self.tracker      = FaceTracker()   # fresh tracker on each start
-        self.btn_start.config(state="disabled")
-        self.btn_stop.config(state="normal")
-        threading.Thread(target=self._loop, daemon=True).start()
+        html = ""
+        for e in reversed(st.session_state.log[-18:]):
+            css = {"With Mask":"log-mask",
+                   "No Mask":"log-nomask",
+                   "Improper Mask":"log-improper"}.get(e["status"],"")
+            em  = EMOJI.get(e["status"],"")
+            html += (f"<div class='log-row {css}'>"
+                     f"<span>Face-{e['fid']}&nbsp;&nbsp;"
+                     f"{em} {e['status']}</span>"
+                     f"<span>{e['ts'][11:19]}&nbsp;{e['conf']:.0%}</span>"
+                     f"</div>")
+        log_ph.markdown(html, unsafe_allow_html=True)
 
-    def stop(self):
-        self.running = False
-        if self.cap:
-            self.cap.release()
-            self.cap = None
-        self.btn_start.config(state="normal")
-        self.btn_stop.config(state="disabled")
-        self.canvas.delete("all")
-        self.badge_var.set("⬤  Stopped")
-        self.badge_lbl.config(fg="#aaaaaa")
+    render_log()
 
-    def reset_tracker(self):
-        """Forget all face IDs — next detection treated as new."""
-        self.tracker = FaceTracker()
-        self.root.after(0, self.excel_sv.set,
-                        "🔄 Tracker reset — faces will re-log")
+with left:
+    # ── MODE: UPLOAD IMAGE ──────────────────────────────────────────
+    if "Upload" in mode:
+        st.markdown("### 🖼️ Upload Image for Detection")
+        uploaded = st.file_uploader(
+            "Upload a photo (JPG/PNG)", type=["jpg","jpeg","png"])
 
-    # ── Detection loop ──────────────────────────────────────────────
+        if uploaded:
+            file_bytes = np.frombuffer(uploaded.read(), np.uint8)
+            frame      = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
 
-    def _loop(self):
-        while self.running:
-            try:
-                ret, frame = self.cap.read()
-                if not ret:
-                    time.sleep(0.03); continue
+            detector_info = load_detector()
+            raw     = detect(frame, detector_info, conf_val)
+            tracked = st.session_state.tracker.update(raw)
+            annotated = draw(frame.copy(), tracked)
 
-                annotated = frame.copy()
+            # Log new detections
+            for (_,_,_,_,status,conf,fid,is_new) in tracked:
+                if is_new:
+                    st.session_state.stats[status] = \
+                        st.session_state.stats.get(status,0)+1
+                    st.session_state.log.append({
+                        "fid":status,"fid":fid,"status":status,
+                        "conf":conf,
+                        "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        "notes":"Image upload"})
 
-                # Raw detections
-                try:
-                    raw = self.detector.detect(frame) if self.detector else []
-                except Exception:
-                    raw = []
+            rgb = cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB)
+            st.image(rgb, use_container_width=True)
 
-                # Feed through tracker
-                tracked = self.tracker.update(raw)
+            if tracked:
+                best = max(tracked, key=lambda x:x[5])
+                css  = {"With Mask":"status-mask",
+                        "No Mask":"status-nomask",
+                        "Improper Mask":"status-improper"}.get(best[4],"")
+                em   = EMOJI.get(best[4],"")
+                st.markdown(
+                    f"<div class='status-big {css}'>"
+                    f"{em}  {best[4].upper()}  ({best[5]:.0%})</div>",
+                    unsafe_allow_html=True)
+            else:
+                st.markdown(
+                    "<div class='status-big status-idle'>"
+                    "⬤  No face detected</div>",
+                    unsafe_allow_html=True)
 
-                best_s, best_c = "Unknown", 0.0
+            face_ph.info(
+                f"👤 {len(st.session_state.tracker.tracks)} face(s) tracked")
+            render_log()
 
-                for (x1, y1, x2, y2, status, conf,
-                     face_id, is_new_status) in tracked:
+    # ── MODE: LIVE WEBCAM ───────────────────────────────────────────
+    else:
+        st.markdown("### 📷 Live Webcam Detection")
 
-                    _, bgr, emoji = STATUS_COLOR.get(
-                        status, ("#aaa",(150,150,150),""))
+        frame_ph  = st.empty()
+        status_ph = st.empty()
 
-                    # Draw bounding box
-                    cv2.rectangle(annotated, (x1,y1), (x2,y2), bgr, 3)
+        c1, c2 = st.columns(2)
+        with c1:
+            if st.button("▶ Start Detection", use_container_width=True):
+                st.session_state.running = True
+                st.session_state.tracker = FaceTracker()
+        with c2:
+            if st.button("⏹ Stop", use_container_width=True):
+                st.session_state.running = False
 
-                    # Label: Face-ID + status + conf
-                    lbl = f"  Face-{face_id} | {status}  {conf:.0%}"
-                    (tw,th),_ = cv2.getTextSize(
-                        lbl, cv2.FONT_HERSHEY_SIMPLEX, 0.65, 2)
-                    cv2.rectangle(annotated,
-                                  (x1, y1-th-16),(x1+tw+4, y1), bgr, -1)
-                    cv2.putText(annotated, lbl, (x1+2, y1-6),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.65,
-                                (255,255,255), 2, cv2.LINE_AA)
+        if not st.session_state.running:
+            frame_ph.markdown("""
+            <div class='idle-box'>
+              <div class='idle-icon'>📷</div>
+              <div class='idle-text'>CAMERA FEED WILL APPEAR HERE</div>
+              <div style='font-size:0.8rem;color:#3a4470;'>
+                Click ▶ Start Detection to begin
+              </div>
+            </div>""", unsafe_allow_html=True)
 
-                    # "NEW" badge if just logged
-                    if is_new_status:
-                        cv2.putText(annotated, "● LOGGED",
-                                    (x1, y2+22),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.55,
-                                    bgr, 2, cv2.LINE_AA)
-                        self._record(face_id, status, conf)
+        if st.session_state.running:
+            detector_info = load_detector()
+            cap = cv2.VideoCapture(0)
 
-                    if conf > best_c:
-                        best_c, best_s = conf, status
+            if not cap.isOpened():
+                st.error(
+                    "❌ **Camera not available.**\n\n"
+                    "Streamlit Cloud servers have no webcam.\n\n"
+                    "**Use '🖼️ Upload Image' mode instead**, "
+                    "or run the app locally with ngrok for live webcam.")
+                st.session_state.running = False
+            else:
+                cap.set(cv2.CAP_PROP_FRAME_WIDTH,  1280)
+                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+                cap.set(cv2.CAP_PROP_FPS, 30)
 
-                # Update face count indicator
-                active = len(self.tracker.tracks)
-                self.root.after(0, self._faces_sv.set,
-                                f"👤  Active faces: {active}")
+                st.markdown(
+                    "<div style='margin-bottom:6px'>"
+                    "<span class='live-dot'></span>"
+                    "<span style='font-family:Space Mono,monospace;"
+                    "font-size:0.7rem;color:#e74c3c;letter-spacing:.1em'>"
+                    "LIVE</span></div>",
+                    unsafe_allow_html=True)
 
-                self.root.after(0, self._render_frame, annotated.copy())
-                self.root.after(0, self._badge, best_s, best_c)
+                while st.session_state.running:
+                    ret, frame = cap.read()
+                    if not ret: break
 
-            except Exception as e:
-                print(f"[loop error] {e}")
-                time.sleep(0.1)
+                    try:
+                        raw = detect(frame, detector_info, conf_val)
+                    except Exception:
+                        raw = []
 
-    # ── Render ──────────────────────────────────────────────────────
+                    tracked   = st.session_state.tracker.update(raw)
+                    annotated = draw(frame.copy(), tracked)
 
-    def _render_frame(self, frame):
-        if not self.running: return
-        cw = max(self.canvas.winfo_width(),  640)
-        ch = max(self.canvas.winfo_height(), 440)
-        rgb   = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        h,w   = rgb.shape[:2]
-        sc    = min(cw/w, ch/h)
-        nw,nh = int(w*sc), int(h*sc)
-        img   = Image.fromarray(rgb).resize((nw,nh), Image.LANCZOS)
-        imgtk = ImageTk.PhotoImage(image=img)
-        self.canvas.delete("all")
-        self.canvas.create_image(cw//2, ch//2, anchor="center", image=imgtk)
-        self._imgtk = imgtk
+                    for (_,_,_,_,status,conf,fid,is_new) in tracked:
+                        if is_new:
+                            st.session_state.stats[status] = \
+                                st.session_state.stats.get(status,0)+1
+                            st.session_state.log.append({
+                                "fid":fid,"status":status,"conf":conf,
+                                "ts":datetime.now().strftime(
+                                    "%Y-%m-%d %H:%M:%S"),
+                                "notes":"Live webcam"})
 
-    def _badge(self, s, c):
-        if s in STATUS_COLOR:
-            col,_,emoji = STATUS_COLOR[s]
-            self.badge_var.set(f"{emoji}  {s.upper()}  ({c:.0%})")
-            self.badge_lbl.config(fg=col)
-        else:
-            self.badge_var.set("⬤  No face detected")
-            self.badge_lbl.config(fg="#aaaaaa")
+                    rgb = cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB)
+                    frame_ph.image(rgb, channels="RGB",
+                                   use_container_width=True)
 
-    # ── Record ──────────────────────────────────────────────────────
+                    if tracked:
+                        best = max(tracked, key=lambda x:x[5])
+                        css  = {"With Mask":"status-mask",
+                                "No Mask":"status-nomask",
+                                "Improper Mask":"status-improper"
+                                }.get(best[4],"")
+                        em   = EMOJI.get(best[4],"")
+                        status_ph.markdown(
+                            f"<div class='status-big {css}'>"
+                            f"{em}  {best[4].upper()}  "
+                            f"({best[5]:.0%})</div>",
+                            unsafe_allow_html=True)
+                    else:
+                        status_ph.markdown(
+                            "<div class='status-big status-idle'>"
+                            "⬤  No face detected</div>",
+                            unsafe_allow_html=True)
 
-    def _record(self, face_id, status, conf):
-        self.stats["total"] += 1
-        if status in self.stats:
-            self.stats[status] += 1
+                    n = len(st.session_state.tracker.tracks)
+                    face_ph.info(f"👤 {n} face(s) currently tracked")
+                    render_log()
+                    time.sleep(0.04)
 
-        try:
-            excel_log(face_id, status, conf,
-                      f"Status change detected")
-            self.root.after(0, self.excel_sv.set, "📁 Excel: Saved ✓")
-        except PermissionError:
-            self.root.after(0, self.excel_sv.set,
-                            "⚠ Excel locked — close the file!")
-            if not self._excel_warn:
-                self._excel_warn = True
-                self.root.after(0, messagebox.showwarning,
-                    "Excel File Locked",
-                    "Close mask_detection_log.xlsx in Excel\n"
-                    "so the app can write to it.")
-        except Exception as e:
-            self.root.after(0, self.excel_sv.set, f"⚠ {e}")
-
-        def _upd():
-            for k,sv in self._svars.items():
-                _,_,emoji = STATUS_COLOR[k]
-                sv.set(f"{emoji}  {k}: {self.stats[k]}")
-            self._total_sv.set(
-                f"📋  Total logged: {self.stats['total']}")
-            entry = (f"[{datetime.now().strftime('%H:%M:%S')}] "
-                     f"Face-{face_id:<3} {status:<18} {conf:.0%}\n")
-            self.log_box.config(state="normal")
-            self.log_box.insert("end", entry)
-            self.log_box.see("end")
-            self.log_box.config(state="disabled")
-
-        self.root.after(0, _upd)
-
-    # ── Misc ────────────────────────────────────────────────────────
-
-    def open_excel(self):
-        if not os.path.exists(EXCEL_FILE):
-            wb = _excel_init(EXCEL_FILE)
-            wb.save(EXCEL_FILE)
-        (os.startfile(EXCEL_FILE) if os.name=="nt"
-         else os.system(f"xdg-open '{EXCEL_FILE}'"))
-
-    def on_close(self):
-        self.running = False
-        if self.cap: self.cap.release()
-        self.root.destroy()
-
-
-# ═══════════════════════════════════════════════════════════════════
-if __name__ == "__main__":
-    root = tk.Tk()
-    app  = App(root)
-    root.protocol("WM_DELETE_WINDOW", app.on_close)
-    root.geometry("1150x680")
-    root.minsize(920, 560)
-    root.mainloop()
+                cap.release()
