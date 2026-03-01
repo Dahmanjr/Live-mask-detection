@@ -1,4 +1,6 @@
-opencv-python-headless==4.9.0.80
-numpy==1.26.4
-pillow==10.3.0
-openpyxl==3.1.2
+opencv-python-headless
+numpy
+pillow
+openpyxl
+streamlit-webrtc
+av
